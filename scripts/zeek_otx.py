@@ -4,6 +4,7 @@ import sys
 import logging
 import datetime
 import shutil
+import time
 
 from argparse import ArgumentParser
 from configparser import ConfigParser
@@ -74,6 +75,10 @@ def parse_args():
     parser.add_argument('-c', '--config',
                         help='configuration file path',
                         default='zeek_otx.conf')
+    parser.add_argument('--duplicates',action='store_true',
+                        help='removes duplicate indiciators (will keep the newest based on created date)')
+    parser.add_argument('--scrub',action='store_true',
+                        help='additional scrubbing of indicators (beyond the URL scrubbing)')
     return parser.parse_args()
 
 def parse_config(config_path):
@@ -117,7 +122,7 @@ def sync_otx_cache(api_key, days, otx_cache):
         sys.exit(1)
     return cache
 
-def sanitize_url(url):
+def sanitize_url(url, scrub):
     '''Sanitize url for import in to Zeek intel framework.
 
     The Zeek intel framework does not support url scheme (http, https, etc.)
@@ -125,18 +130,24 @@ def sanitize_url(url):
 
     Args:
         url: a string url
+	scrub: removes null bytes which are present in some indicators 
     Returns
         A string of the sanitized url.
     '''
+
+    if scrub:
+        #Add a check for null bytes that are present in some of the URL indicators
+        url = url.split("\x00")[0]
     parsed_url = urlparse(url)
     return parsed_url.geturl().replace('{0}://'.format(parsed_url.scheme), '')
 
-def main(api_key, days, outfile, do_notice, otx_cache):
+def main(api_key, days, outfile, do_notice, otx_cache, duplicates, scrub):
     '''Main runtime routine.'''
 
     cache = sync_otx_cache(api_key, days, otx_cache)
 
     iocs = set()
+    duplicate_list = dict()
     # iterate through pulses, building the zeek intel file
     for pulse in cache.getall_iter():
         pulse_name = pulse.get('name')
@@ -161,11 +172,32 @@ def main(api_key, days, outfile, do_notice, otx_cache):
                 indicator_type = ioc.get('type')
                 # special handling for URL types
                 if indicator_type == 'URL':
-                    indicator = sanitize_url(indicator)
-
-                iocs.add('\t'.join([indicator,
-                                    _MAP.get(indicator_type),
-                                    metadata]))
+                    indicator = sanitize_url(indicator, scrub)
+                # test for duplicates if set on CLI
+                if duplicates:
+                    after = ioc.get('created')
+                    after = after.split('T',1)
+                    date_tuple = after[0]
+                    date_tuple = date_tuple.split('-')
+                    date_struct = datetime.date(int(date_tuple[0]), int(date_tuple[1]), int(date_tuple[2]))
+                    unixtime = int(time.mktime(date_struct.timetuple()))
+                    if indicator not in duplicate_list:
+                        iocs.add('\t'.join([indicator,
+                            _MAP.get(indicator_type),
+                            metadata]))
+                        # track duplicate entries
+                        duplicate_list.setdefault(indicator, {})['date'] = unixtime
+                        duplicate_list.setdefault(indicator, {})['name'] = indicator
+                    else:
+		        # check which indicator is newer and use that
+                        unixtime_current = duplicate_list[indicator]['date']
+                        if unixtime_current < unixtime:
+                            duplicate_list[indicator]['date'] = unixtime
+                            duplicate_list[indicator]['name'] = indicator
+                else:
+                    iocs.add('\t'.join([indicator,
+                        _MAP.get(indicator_type),
+                        metadata]))
 
     tf_name = ''
     with NamedTemporaryFile(mode='w', delete=False) as tf:
@@ -185,6 +217,8 @@ if __name__ == '__main__':
     # Parse arguments from sys.argv
     args = parse_args()
     CONFIG = parse_config(args.config)
+    DUPLICATE = args.duplicates
+    SCRUB = args.scrub
 
     # Validate configuration values
     API_KEY = CONFIG.get('otx', 'api_key')
@@ -207,4 +241,4 @@ if __name__ == '__main__':
 
     OTX_CACHE = CONFIG.get('otx', 'otx_cache')
 
-    main(API_KEY, DAYS, OUTFILE, DO_NOTICE, OTX_CACHE)
+    main(API_KEY, DAYS, OUTFILE, DO_NOTICE, OTX_CACHE, DUPLICATE, SCRUB)
